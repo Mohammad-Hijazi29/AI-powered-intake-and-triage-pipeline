@@ -1,0 +1,118 @@
+// === 1. Get the parsed result (parser primary, manual parse as fallback) ===
+let data;
+
+if ($json.output !== undefined && $json.output !== null) {
+  data = $json.output;
+} else {
+  let raw = "";
+  if (typeof $json.text === "string") {
+    raw = $json.text;
+  } else if ($json.response && typeof $json.response.text === "string") {
+    raw = $json.response.text;
+  }
+  const cleaned = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
+  try {
+    data = JSON.parse(cleaned);
+  } catch (error) {
+    data = {
+      category: "Unknown",
+      priority: "Medium",
+      confidence: 0,
+      core_issue: cleaned,
+      entities: {},
+      billing_details: { charged_amount: null, expected_amount: null},
+      urgency_signal: "",
+      escalation_signals: {},
+      summary: cleaned
+    };
+  }
+}
+
+// === 2. Original message from the Webhook node ===
+const webhookData = $('Webhook').item.json.body;
+const message = (webhookData && webhookData.message) ? webhookData.message : "";
+const source = (webhookData && webhookData.source) ? webhookData.source : "";
+
+// === 3. Deterministic routing map ===
+const routingMap = {
+  "Bug Report": "Engineering",
+  "Incident/Outage": "Engineering",
+  "Feature Request": "Product",
+  "Billing Issue": "Billing",
+  "Technical Question": "IT/Security"
+};
+
+// === 4. Deterministic billing discrepancy (arithmetic stays in code) ===
+const billing = data.billing_details ?? {};
+const chargedAmount = billing.charged_amount;
+const expectedAmount = billing.expected_amount;
+
+let billingDiscrepancy = null;
+if (Number.isFinite(chargedAmount) === true && Number.isFinite(expectedAmount) === true) {
+  billingDiscrepancy = Math.abs(chargedAmount - expectedAmount);
+}
+
+// === 5. Escalation logic — collect EVERY matching reason ===
+const escalationReasons = [];
+
+const confidence = Number(data.confidence);
+if (Number.isFinite(confidence) === false) {
+  escalationReasons.push("Invalid classification confidence");
+} else if (confidence < 70) {
+  escalationReasons.push("Low classification confidence (" + confidence + ")");
+}
+
+const signals = data.escalation_signals ?? {};
+if (signals.widespread_service_impact === true) {
+  escalationReasons.push("Widespread service impact detected");
+}
+if (signals.critical_workflow_blocked === true) {
+  escalationReasons.push("Critical business workflow blocked");
+}
+if (signals.security_risk === true) {
+  escalationReasons.push("Potential security risk detected");
+}
+
+if (data.category === "Billing Issue" && billingDiscrepancy !== null && billingDiscrepancy > 500) {
+  escalationReasons.push("Billing discrepancy over $500 (" + billingDiscrepancy + ")");
+}
+
+// === 6. Final queue — escalation overrides routing ===
+let escalated = escalationReasons.length > 0;
+let queue;
+
+if (escalated === true) {
+  queue = "Escalation";
+} else {
+  queue = routingMap[data.category];
+  if (queue === undefined) {
+    escalated = true;
+    queue = "Escalation";
+    escalationReasons.push("Unrecognized category");
+  }
+}
+
+const escalationReason = escalationReasons.join("; ");
+
+// === 7. Flat record for Google Sheets ===
+const entities = data.entities ?? {};
+
+return {
+  json: {
+    source: source,
+    raw_message: message,
+    category: data.category,
+    priority: data.priority,
+    confidence: data.confidence,
+    core_issue: data.core_issue,
+    entities: JSON.stringify(entities),
+    charged_amount: (chargedAmount === null || chargedAmount === undefined) ? "" : chargedAmount,
+    expected_amount: (expectedAmount === null || expectedAmount === undefined) ? "" : expectedAmount,
+    billing_discrepancy: (billingDiscrepancy === null) ? "" : billingDiscrepancy,
+    urgency_signal: data.urgency_signal,
+    summary: data.summary,
+    queue: queue,
+    escalated: escalated,
+    escalation_reason: escalationReason
+  }
+};
